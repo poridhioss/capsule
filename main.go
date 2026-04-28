@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 )
 
 const inspectScript = `
@@ -32,25 +33,76 @@ cat /proc/net/dev | head -5
 echo ""
 
 echo "========== END INSPECTION =========="
+sleep 60
 `
 
 func main() {
-	fmt.Println("=== Containers Are Just Processes ===")
-	fmt.Printf("Parent process PID: %d\n\n", os.Getpid())
+	if len(os.Args) > 1 && os.Args[1] == "child" {
+		child()
+		return
+	}
+	parent()
+}
 
-	// Create a child process running /bin/sh with our inspection script
-	cmd := exec.Command("/bin/sh", "-c", inspectScript)
+func parent() {
+	fmt.Println("=== Process Isolation with Namespaces ===")
+	fmt.Printf("Parent PID: %d\n", os.Getpid())
+	hostname, _ := os.Hostname()
+	fmt.Printf("Parent hostname: %s\n\n", hostname)
 
-	// Connect child's I/O to parent's I/O
+	cmd := exec.Command("/proc/self/exe", "child")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID |
+			syscall.CLONE_NEWUTS |
+			syscall.CLONE_NEWNS,
+	}
 
-	// Run the child process and wait for it to finish
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running child process: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Child process exited. All output above came from the child.")
+	fmt.Println("\nChild process exited.")
+	hostname, _ = os.Hostname()
+	fmt.Printf("Parent hostname after child exit: %s\n", hostname)
+}
+
+func child() {
+	fmt.Println("--- Running inside new namespaces ---")
+
+	// Set hostname in the new UTS namespace
+	if err := syscall.Sethostname([]byte("capsule")); err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting hostname: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Make root mount private to prevent mount propagation
+	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Error making root private: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Mount a fresh /proc to reflect the new PID namespace
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Error mounting /proc: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Run the inspection script
+	cmd := exec.Command("/bin/sh", "-c", inspectScript)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error running inspection: %v\n", err)
+	}
+
+	// Unmount /proc before exiting to restore parent's view
+	if err := syscall.Unmount("/proc", 0); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to unmount /proc: %v\n", err)
+	}
 }
