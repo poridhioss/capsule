@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
+
+	"github.com/poridhioss/capsule/pkg/filesystem"
 )
 
 const inspectScript = `
@@ -24,16 +27,24 @@ echo "--- Filesystem Root ---"
 ls /
 echo ""
 
-echo "--- Mount Table (first 10 entries) ---"
-cat /proc/self/mounts | head -10
+if [ -f /etc/alpine-release ]; then
+  echo "--- Alpine Release ---"
+  cat /etc/alpine-release
+  echo ""
+fi
+
+echo "--- Mount Table ---"
+cat /proc/self/mounts
 echo ""
 
-echo "--- Network Interfaces ---"
-cat /proc/net/dev | head -5
-echo ""
+echo "--- Cannot See Host File ---"
+if [ -f /home ]; then
+  echo "  /home exists (unexpected)"
+else
+  ls /home 2>&1 || echo "  /home not accessible (expected, host is gone)"
+fi
 
 echo "========== END INSPECTION =========="
-sleep 60
 `
 
 func main() {
@@ -71,27 +82,40 @@ func parent() {
 }
 
 func child() {
-	fmt.Println("--- Running inside new namespaces ---")
+	fmt.Println("--- Running inside new namespaces and rootfs ---")
 
-	// Set hostname in the new UTS namespace
+	// Set hostname in the new UTS namespace.
 	if err := syscall.Sethostname([]byte("capsule")); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting hostname: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Make root mount private to prevent mount propagation
+	// Make root mount private to prevent mount propagation to host.
 	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "Error making root private: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Mount a fresh /proc to reflect the new PID namespace
+	// Resolve the absolute path to ./rootfs so pivot_root sees a real path.
+	rootfs, err := filepath.Abs("rootfs")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving rootfs path: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Pivot into the Alpine rootfs.
+	if err := filesystem.PivotRoot(rootfs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error pivoting root: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Mount a fresh /proc inside the new root.
 	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "Error mounting /proc: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Run the inspection script
+	// Run the inspection script using the rootfs's /bin/sh (busybox ash).
 	cmd := exec.Command("/bin/sh", "-c", inspectScript)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -101,7 +125,6 @@ func child() {
 		fmt.Fprintf(os.Stderr, "Error running inspection: %v\n", err)
 	}
 
-	// Unmount /proc before exiting to restore parent's view
 	if err := syscall.Unmount("/proc", 0); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to unmount /proc: %v\n", err)
 	}
