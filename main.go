@@ -6,7 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
-
+	
+	"github.com/poridhioss/capsule/pkg/cgroup"
 	"github.com/poridhioss/capsule/pkg/filesystem"
 )
 
@@ -33,28 +34,18 @@ echo "--- Process Table (ps) ---"
 ps
 echo ""
 
-echo "--- /dev contents ---"
-ls /dev
+echo "--- Cgroup Membership ---"
+cat /proc/1/cgroup
 echo ""
 
-echo "--- /sys top-level ---"
-ls /sys
-echo ""
-
-echo "--- /dev/null discards output ---"
-echo "hello" > /dev/null && echo "  write to /dev/null OK"
-echo ""
-
-echo "--- /dev/urandom yields random bytes ---"
-head -c 8 /dev/urandom | od -An -tx1
-echo ""
-
-echo "--- /dev/pts is a devpts mount ---"
-grep "devpts" /proc/self/mounts || echo "  devpts not found (unexpected)"
-echo ""
-
-echo "--- Mount Table ---"
-cat /proc/self/mounts
+echo "--- Cgroup Limits and Usage ---"
+CG=/sys/fs/cgroup/capsule/demo
+echo "  memory.max:      $(cat $CG/memory.max)"
+echo "  memory.swap.max: $(cat $CG/memory.swap.max)"
+echo "  memory.current:  $(cat $CG/memory.current)"
+echo "  cpu.max:         $(cat $CG/cpu.max)"
+echo "  cpu.stat (head):"
+head -n 3 $CG/cpu.stat | sed 's/^/    /'
 echo ""
 
 echo "========== END INSPECTION =========="
@@ -69,10 +60,31 @@ func main() {
 }
 
 func parent() {
+	const cgName = "demo"
+
 	fmt.Println("=== Process Isolation with Namespaces ===")
 	fmt.Printf("Parent PID: %d\n", os.Getpid())
-	hostname, _ := os.Hostname()
-	fmt.Printf("Parent hostname: %s\n\n", hostname)
+	host, _ := os.Hostname()
+	fmt.Printf("Parent hostname: %s\n", host)
+	fmt.Println()
+
+	// Create the cgroup before the child starts, so its limits are already
+	// in place when we move the child into it.
+	cfg := cgroup.Config{
+		Name:      cgName,
+		MemoryMax: 50 << 20, // 50 MB
+		SwapMax:   -1,       // disable swap so memory.max is hard
+		CPUQuota:  50,       // 50% of one CPU
+	}
+	if err := cgroup.Create(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating cgroup: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := cgroup.Remove(cgName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove cgroup: %v\n", err)
+		}
+	}()
 
 	cmd := exec.Command("/proc/self/exe", "child")
 	cmd.Stdin = os.Stdin
@@ -84,14 +96,23 @@ func parent() {
 			syscall.CLONE_NEWNS,
 	}
 
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running child process: %v\n", err)
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error starting child: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("\nChild process exited.")
-	hostname, _ = os.Hostname()
-	fmt.Printf("Parent hostname after child exit: %s\n", hostname)
+	// Move the child into the cgroup. From now on the kernel charges all
+	// memory and CPU the child consumes against the limits set above.
+	if err := cgroup.AddProcess(cgName, cmd.Process.Pid); err != nil {
+		fmt.Fprintf(os.Stderr, "Error adding child to cgroup: %v\n", err)
+		// The child is already running; let it finish so we can clean up.
+	}
+
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "Child exited with error: %v\n", err)
+	}
+	fmt.Println("Child process exited.")
+	fmt.Printf("Parent hostname after child exit: %s\n", host)
 }
 
 func child() {
