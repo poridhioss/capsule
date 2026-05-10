@@ -23,26 +23,39 @@ echo "--- Hostname ---"
 echo "  $(hostname)"
 echo ""
 
-echo "--- Filesystem Root ---"
-ls /
-echo ""
-
 if [ -f /etc/alpine-release ]; then
   echo "--- Alpine Release ---"
   cat /etc/alpine-release
   echo ""
 fi
 
+echo "--- Process Table (ps) ---"
+ps
+echo ""
+
+echo "--- /dev contents ---"
+ls /dev
+echo ""
+
+echo "--- /sys top-level ---"
+ls /sys
+echo ""
+
+echo "--- /dev/null discards output ---"
+echo "hello" > /dev/null && echo "  write to /dev/null OK"
+echo ""
+
+echo "--- /dev/urandom yields random bytes ---"
+head -c 8 /dev/urandom | od -An -tx1
+echo ""
+
+echo "--- /dev/pts is a devpts mount ---"
+grep "devpts" /proc/self/mounts || echo "  devpts not found (unexpected)"
+echo ""
+
 echo "--- Mount Table ---"
 cat /proc/self/mounts
 echo ""
-
-echo "--- Cannot See Host File ---"
-if [ -f /home ]; then
-  echo "  /home exists (unexpected)"
-else
-  ls /home 2>&1 || echo "  /home not accessible (expected, host is gone)"
-fi
 
 echo "========== END INSPECTION =========="
 `
@@ -109,9 +122,9 @@ func child() {
 		os.Exit(1)
 	}
 
-	// Mount a fresh /proc inside the new root.
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "Error mounting /proc: %v\n", err)
+	// Mount /proc, /sys, /dev (with device nodes and symlinks), and /dev/pts.
+	if err := filesystem.MountAll(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error mounting virtual filesystems: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -125,7 +138,7 @@ func child() {
 		fmt.Fprintf(os.Stderr, "Error running inspection: %v\n", err)
 	}
 
-	if err := syscall.Unmount("/proc", 0); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to unmount /proc: %v\n", err)
+	if err := filesystem.UnmountAll(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to unmount: %v\n", err)
 	}
 }
