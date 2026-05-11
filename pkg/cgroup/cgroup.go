@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
+	"time"
 )
 
 // Root is the parent directory under /sys/fs/cgroup that holds every
@@ -18,6 +21,7 @@ type Config struct {
 	MemoryMax int64  // bytes; 0 = unlimited
 	SwapMax   int64  // bytes; 0 = unlimited (use a negative value for "disable swap")
 	CPUQuota  int    // percent of one CPU; 0 = unlimited; 50 = half a core; 200 = two cores
+	PIDsMax   int    // process count; 0 = unlimited
 }
 
 // Create makes the cgroup directory under Root and writes the requested limits.
@@ -43,6 +47,11 @@ func Create(c Config) error {
 			return fmt.Errorf("write cpu.max: %w", err)
 		}
 	}
+	if c.PIDsMax > 0 {
+		if err := writePidsMax(dir, c.PIDsMax); err != nil {
+			return fmt.Errorf("write pids.max: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -53,16 +62,51 @@ func AddProcess(name string, pid int) error {
 	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
 }
 
-// Remove deletes the cgroup directory. The cgroup must be empty
-// (cgroup.procs has no PIDs) or rmdir returns EBUSY. For Lab 05 the
-// child has exited by the time we call Remove, so the cgroup is empty.
-// Lab 06 replaces this with a more robust Cleanup that drains lingering PIDs.
-func Remove(name string) error {
+// Cleanup signals every process in the cgroup (SIGTERM, then SIGKILL
+// after a short grace period), then removes the cgroup directory.
+// When the cgroup is already empty the drain is a no-op.
+func Cleanup(name string) error {
 	dir := filepath.Join(Root, name)
+
+	// 1. Polite stop: SIGTERM to every PID in the cgroup.
+	if pids, err := readPids(dir); err == nil && len(pids) > 0 {
+		for _, pid := range pids {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+		// 2. Grace period. Well-behaved processes exit during this window.
+		time.Sleep(500 * time.Millisecond)
+
+		// 3. Forceful stop: SIGKILL to whoever is still alive.
+		if pids, err := readPids(dir); err == nil {
+			for _, pid := range pids {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	}
+
+	// 4. rmdir. The cgroup should be empty now.
 	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("rmdir %s: %w", dir, err)
 	}
 	return nil
+}
+
+// readPids reads cgroup.procs and returns the PIDs as ints. An empty
+// file (no processes) returns an empty slice without error.
+func readPids(dir string) ([]int, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data))
+	pids := make([]int, 0, len(fields))
+	for _, f := range fields {
+		pid, err := strconv.Atoi(f)
+		if err == nil {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
 }
 
 // ensureParent makes /sys/fs/cgroup/capsule/ if it does not exist and
@@ -71,9 +115,8 @@ func ensureParent() error {
 	if err := os.Mkdir(Root, 0755); err != nil && !os.IsExist(err) {
 		return err
 	}
-	// "+memory +cpu" tells the kernel to make those controllers available
-	// inside the children of Root.
-	return writeFile(filepath.Join(Root, "cgroup.subtree_control"), "+memory +cpu")
+	return writeFile(filepath.Join(Root, "cgroup.subtree_control"),
+		"+memory +cpu +pids")
 }
 
 // writeFile is a thin wrapper around os.WriteFile that the controller files

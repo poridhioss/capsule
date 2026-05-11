@@ -44,6 +44,9 @@ echo "  memory.max:      $(cat $CG/memory.max)"
 echo "  memory.swap.max: $(cat $CG/memory.swap.max)"
 echo "  memory.current:  $(cat $CG/memory.current)"
 echo "  cpu.max:         $(cat $CG/cpu.max)"
+echo "  pids.max:        $(cat $CG/pids.max)"
+echo "  pids.current:    $(cat $CG/pids.current)"
+echo "  pids.events:     $(cat $CG/pids.events | tr '\n' ' ')"
 echo "  cpu.stat (head):"
 head -n 3 $CG/cpu.stat | sed 's/^/    /'
 echo ""
@@ -75,14 +78,16 @@ func parent() {
 		MemoryMax: 50 << 20, // 50 MB
 		SwapMax:   -1,       // disable swap so memory.max is hard
 		CPUQuota:  50,       // 50% of one CPU
+		PIDsMax:   64,       // cap process count at 64
 	}
+
 	if err := cgroup.Create(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating cgroup: %v\n", err)
 		os.Exit(1)
 	}
 	defer func() {
-		if err := cgroup.Remove(cgName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to remove cgroup: %v\n", err)
+		if err := cgroup.Cleanup(cgName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to clean up cgroup: %v\n", err)
 		}
 	}()
 
