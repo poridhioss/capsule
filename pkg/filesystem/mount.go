@@ -112,3 +112,59 @@ func UnmountAll() error {
 	}
 	return nil
 }
+
+// ParentMountAll mounts the same virtual filesystems into a rootfs directory
+// from the parent process's mount namespace, BEFORE the child is cloned. Used
+// by Lab 07: a child running inside a user namespace can no longer freshly
+// mount sysfs/cgroup2 (their kernel checks ask for caps in the init user_ns
+// the child lacks), and mknod for character devices is forbidden in a user
+// namespace. Doing all of this here, while running as host root in
+// init_user_ns, sidesteps every one of those restrictions. The child inherits
+// the mounts via CLONE_NEWNS and just pivots into the rootfs.
+func ParentMountAll(rootfs string) error {
+	// /sys (read-only).
+	if err := syscall.Mount("sysfs", rootfs+"/sys", "sysfs",
+		syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV|syscall.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("mount sys: %w", err)
+	}
+
+	// /sys/fs/cgroup: bind from host so the container sees the full cgroup
+	// tree (including its own capsule/demo cgroup with the limits set in
+	// Labs 05 and 06). A fresh cgroup2 mount inside a user namespace would
+	// show an empty hierarchy.
+	if err := syscall.Mount("/sys/fs/cgroup", rootfs+"/sys/fs/cgroup", "",
+		syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind /sys/fs/cgroup: %w", err)
+	}
+
+	// /dev as a tmpfs with the standard device nodes. mknod is allowed here
+	// because the parent is in init_user_ns with CAP_MKNOD.
+	if err := syscall.Mount("tmpfs", rootfs+"/dev", "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_STRICTATIME, "mode=755"); err != nil {
+		return fmt.Errorf("mount /dev: %w", err)
+	}
+	for _, d := range defaultDevNodes {
+		dev := int((d.major << 8) | d.minor)
+		if err := syscall.Mknod(rootfs+d.path, syscall.S_IFCHR|d.mode, dev); err != nil {
+			return fmt.Errorf("mknod %s: %w", d.path, err)
+		}
+	}
+	for _, s := range devSymlinks {
+		if err := os.Symlink(s.target, rootfs+s.link); err != nil {
+			return fmt.Errorf("symlink %s -> %s: %w", s.link, s.target, err)
+		}
+	}
+
+	// /dev/pts with a fresh devpts instance.
+	if err := os.MkdirAll(rootfs+"/dev/pts", 0755); err != nil {
+		return fmt.Errorf("mkdir /dev/pts: %w", err)
+	}
+	if err := syscall.Mount("devpts", rootfs+"/dev/pts", "devpts", 0,
+		"newinstance,ptmxmode=0666"); err != nil {
+		return fmt.Errorf("mount /dev/pts: %w", err)
+	}
+	if err := os.Symlink("pts/ptmx", rootfs+"/dev/ptmx"); err != nil {
+		return fmt.Errorf("symlink /dev/ptmx: %w", err)
+	}
+	return nil
+}
