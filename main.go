@@ -55,10 +55,6 @@ echo "lab-08 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
-echo "--- Copy-Up Probe ---"
-echo "  before: $(head -n1 /etc/alpine-release)"
-echo "edited by lab-08" > /etc/alpine-release
-echo "  after:  $(head -n1 /etc/alpine-release)"
 echo "========== END INSPECTION =========="
 `
 
