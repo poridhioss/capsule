@@ -13,9 +13,6 @@ import (
 	"github.com/poridhioss/capsule/pkg/namespace"
 )
 
-// capSysAdmin is the Linux capability number for CAP_SYS_ADMIN. We pass it as
-// an ambient cap so sethostname, mount, and pivot_root still work after exec
-// inside the new user namespace.
 const capSysAdmin = 21
 
 const inspectScript = `
@@ -34,37 +31,34 @@ echo ""
 echo "--- User Identity (inside container) ---"
 echo "  id:      $(id)"
 echo "  whoami:  $(whoami)"
-echo "  euid:    $(id -u)"
-echo "  egid:    $(id -g)"
 echo ""
 
-if [ -f /etc/alpine-release ]; then
-  echo "--- Alpine Release ---"
-  cat /etc/alpine-release
-  echo ""
-fi
-
-echo "--- Process Table (ps) ---"
-ps
+echo "--- Alpine Release ---"
+cat /etc/alpine-release
 echo ""
 
-echo "--- Cgroup Membership ---"
-cat /proc/1/cgroup
+echo "--- Rootfs Backing (mountinfo for /) ---"
+awk '
+$5 == "/" {
+    for (i = 7; i <= NF; i++) {
+        if ($i == "-") {
+            print "  type:", $(i + 1), "  source:", $(i + 2)
+            exit
+        }
+    }
+}
+' /proc/self/mountinfo
 echo ""
 
-echo "--- Cgroup Limits and Usage ---"
-CG=/sys/fs/cgroup/capsule/demo
-echo "  memory.max:      $(cat $CG/memory.max)"
-echo "  memory.swap.max: $(cat $CG/memory.swap.max)"
-echo "  memory.current:  $(cat $CG/memory.current)"
-echo "  cpu.max:         $(cat $CG/cpu.max)"
-echo "  pids.max:        $(cat $CG/pids.max)"
-echo "  pids.current:    $(cat $CG/pids.current)"
-echo "  pids.events:     $(cat $CG/pids.events | tr '\n' ' ')"
-echo "  cpu.stat (head):"
-head -n 3 $CG/cpu.stat | sed 's/^/    /'
+echo "--- Writable Layer Probe ---"
+echo "lab-08 was here" > /marker.txt
+echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
+echo "--- Copy-Up Probe ---"
+echo "  before: $(head -n1 /etc/alpine-release)"
+echo "edited by lab-08" > /etc/alpine-release
+echo "  after:  $(head -n1 /etc/alpine-release)"
 echo "========== END INSPECTION =========="
 `
 
@@ -78,11 +72,14 @@ func main() {
 
 func parent() {
 	const cgName = "demo"
+	containerName := "demo"
+	if v := os.Getenv("CAPSULE_NAME"); v != "" {
+		containerName = v
+	}
 
-	fmt.Println("=== Process Isolation with Namespaces ===")
+	fmt.Println("=== OverlayFS Layered Container ===")
 	fmt.Printf("Parent PID: %d\n", os.Getpid())
-	host, _ := os.Hostname()
-	fmt.Printf("Parent hostname: %s\n", host)
+	fmt.Printf("Container name: %s\n", containerName)
 	fmt.Println()
 
 	cfg := cgroup.Config{
@@ -102,9 +99,6 @@ func parent() {
 		}
 	}()
 
-	// Give the parent its own mount namespace so the staging mounts below
-	// stay scoped and do not leak to the host. Mount root private to stop
-	// propagation in either direction.
 	if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil {
 		fmt.Fprintf(os.Stderr, "Error unsharing mount ns: %v\n", err)
 		os.Exit(1)
@@ -114,100 +108,121 @@ func parent() {
 		os.Exit(1)
 	}
 
-	rootfs, err := filepath.Abs("rootfs")
+	lower, err := filepath.Abs("images/alpine")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving rootfs path: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error resolving lower path: %v\n", err)
+		os.Exit(1)
+	}
+	base, err := filepath.Abs(filepath.Join("containers", containerName))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving container path: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Bind rootfs onto itself so it becomes a separate mount point. Done here
-	// in init_user_ns to sidestep the user-namespace bind restriction the
-	// child would otherwise hit.
-	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "Error bind-mounting rootfs: %v\n", err)
+	overlay := filesystem.OverlayConfig{
+		LowerDirs: []string{lower},
+		UpperDir:  filepath.Join(base, "upper"),
+		WorkDir:   filepath.Join(base, "work"),
+		MergedDir: filepath.Join(base, "merged"),
+	}
+
+	hostUID, hostGID := unprivilegedHostIDs()
+
+	// MountOverlay normally creates all three directories. However, upper must
+	// already belong to the mapped host user before the overlay is mounted.
+	// Otherwise, the first merged-root inode can remain root-owned, preventing
+	// container root (mapped to hostUID) from creating /.old_root.
+	if err := os.MkdirAll(overlay.UpperDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating upper directory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Stage /sys, /sys/fs/cgroup, /dev, /dev/pts INSIDE rootfs from here.
-	// The child inherits these via CLONE_NEWNS and only has /proc left to mount.
-	if err := filesystem.ParentMountAll(rootfs); err != nil {
-		fmt.Fprintf(os.Stderr, "Error staging mounts in rootfs: %v\n", err)
+	if err := os.Chown(overlay.UpperDir, hostUID, hostGID); err != nil {
+		fmt.Fprintf(os.Stderr, "Error chowning upper: %v\n", err)
 		os.Exit(1)
 	}
 
-	cmd := exec.Command("/proc/self/exe", "child")
+	if err := filesystem.MountOverlay(overlay); err != nil {
+		fmt.Fprintf(os.Stderr, "Error mounting overlay: %v\n", err)
+		os.Exit(1)
+	}
+
+	defer func() {
+		if err := filesystem.UnmountOverlay(overlay.MergedDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to unmount overlay: %v\n", err)
+		}
+	}()
+
+	// From here on, the merged directory plays the role that the flat rootfs
+	// played in Lab 07: bind it onto itself, then stage the virtual filesystems
+	// inside it from the parent.
+	if err := syscall.Mount(overlay.MergedDir, overlay.MergedDir, "",
+		syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Error bind-mounting merged: %v\n", err)
+		os.Exit(1)
+	}
+	if err := filesystem.ParentMountAll(overlay.MergedDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Error staging mounts in merged: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmd := exec.Command("/proc/self/exe", "child", overlay.MergedDir)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	hostUID, hostGID := unprivilegedHostIDs()
 	uidMap, gidMap := namespace.DefaultMapping(hostUID, hostGID)
-
 	nsCfg := namespace.Config{
-		PID:    true,
-		UTS:    true,
-		Mount:  true,
-		User:   true,
-		UIDMap: uidMap,
-		GIDMap: gidMap,
-		// Without ambient CAP_SYS_ADMIN the child loses caps across exec
-		// because the capsule binary is owned by host root, which is not
-		// mapped into the new user namespace.
+		PID:         true,
+		UTS:         true,
+		Mount:       true,
+		User:        true,
+		UIDMap:      uidMap,
+		GIDMap:      gidMap,
 		AmbientCaps: []uintptr{capSysAdmin},
 	}
 	nsCfg.Apply(cmd)
-
-	// Set the child's UID/GID inside the namespace to 0 before exec. Without
-	// this, the child's host UID (0, inherited from sudo) is unmapped in the
-	// user namespace and shows up as the overflow UID (65534).
 	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0, NoSetGroups: true}
 
-	fmt.Printf("Mapping container UID 0 -> host UID %d\n", hostUID)
+	fmt.Printf("Lower:  %s\n", lower)
+	fmt.Printf("Upper:  %s\n", overlay.UpperDir)
+	fmt.Printf("Merged: %s\n", overlay.MergedDir)
+	fmt.Printf("Mapping container UID 0 -> host UID %d\n\n", hostUID)
 
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting child: %v\n", err)
 		os.Exit(1)
 	}
-
 	if err := cgroup.AddProcess(cgName, cmd.Process.Pid); err != nil {
 		fmt.Fprintf(os.Stderr, "Error adding child to cgroup: %v\n", err)
 	}
-
 	if err := cmd.Wait(); err != nil {
 		fmt.Fprintf(os.Stderr, "Child exited with error: %v\n", err)
 	}
 	fmt.Println("Child process exited.")
-	fmt.Printf("Parent hostname after child exit: %s\n", host)
 }
 
 func child() {
-	fmt.Println("--- Running inside new namespaces and rootfs ---")
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "child: missing merged path argument")
+		os.Exit(1)
+	}
+	merged := os.Args[2]
 
 	if err := syscall.Sethostname([]byte("capsule")); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting hostname: %v\n", err)
 		os.Exit(1)
 	}
-
 	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "Error making root private: %v\n", err)
 		os.Exit(1)
 	}
-
-	rootfs, err := filepath.Abs("rootfs")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving rootfs path: %v\n", err)
-		os.Exit(1)
-	}
-
-	// /proc must be mounted from inside the child so it reflects the new
-	// PID namespace. The parent pre-mounted /sys, /sys/fs/cgroup, /dev, /dev/pts.
-	if err := syscall.Mount("proc", rootfs+"/proc", "proc",
+	if err := syscall.Mount("proc", merged+"/proc", "proc",
 		syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "Error mounting /proc: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := filesystem.PivotRoot(rootfs); err != nil {
+	if err := filesystem.PivotRoot(merged); err != nil {
 		fmt.Fprintf(os.Stderr, "Error pivoting root: %v\n", err)
 		os.Exit(1)
 	}
@@ -216,13 +231,11 @@ func child() {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running inspection: %v\n", err)
 	}
 }
 
-// Returns SUDO_UID/SUDO_GID, or 65534 (nobody) if either is unset or zero.
 func unprivilegedHostIDs() (int, int) {
 	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
 	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
