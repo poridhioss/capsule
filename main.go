@@ -14,6 +14,7 @@ import (
 
 	"github.com/poridhioss/capsule/pkg/cgroup"
 	"github.com/poridhioss/capsule/pkg/filesystem"
+	"github.com/poridhioss/capsule/pkg/image"
 	"github.com/poridhioss/capsule/pkg/namespace"
 )
 
@@ -40,7 +41,11 @@ echo "  whoami:  $(whoami)"
 echo ""
 
 echo "--- Alpine Release ---"
-cat /etc/alpine-release
+if [ -f /etc/alpine-release ]; then
+    cat /etc/alpine-release
+else
+    echo "  this image is not Alpine"
+fi
 echo ""
 
 echo "--- Rootfs Backing (mountinfo for /) ---"
@@ -57,7 +62,7 @@ $5 == "/" {
 echo ""
 
 echo "--- Writable Layer Probe ---"
-echo "lab-09 was here" > /marker.txt
+echo "lab-10 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
@@ -156,6 +161,9 @@ func main() {
 	var err error
 	if len(os.Args) > 1 && os.Args[1] == "child" {
 		err = child()
+	} else if len(os.Args) > 1 && (os.Args[1] == "pull" || os.Args[1] == "images" || os.Args[1] == "tag" || os.Args[1] == "rmi") {
+		uid, gid := unprivilegedHostIDs()
+		err = image.Command(os.Args[1:], uid, gid)
 	} else {
 		err = parent()
 	}
@@ -173,6 +181,7 @@ func main() {
 func parent() (result error) {
 	var specs []filesystem.Mount
 	flags := flag.NewFlagSet("capsule", flag.ContinueOnError)
+	imageName := flags.String("image", "alpine:latest", "local or Docker Hub image")
 	flags.Var(mountFlag{&specs, filesystem.ParseVolume}, "v", "source:/target[:ro|rw]")
 	flags.Var(mountFlag{&specs, filesystem.ParseTmpfs}, "tmpfs", "/target[:size=16m,mode=1777]")
 	createVolume := flags.String("volume-create", "", "create or reuse a named volume")
@@ -232,7 +241,15 @@ func parent() (result error) {
 	if err := filesystem.ValidateName(containerName); err != nil {
 		return err
 	}
-	lower, err := filepath.Abs("images/alpine")
+	if runtime.GOARCH != "amd64" {
+		return fmt.Errorf("this lab runs linux/amd64 images; use the x86-64 lab VM")
+	}
+	store, err := image.OpenStore(image.StoreRoot, hostUID, hostGID)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	imageID, lowers, err := store.Ensure(*imageName)
 	if err != nil {
 		return err
 	}
@@ -240,8 +257,11 @@ func parent() (result error) {
 	if err != nil {
 		return err
 	}
+	if err := image.PinContainer(base, imageID); err != nil {
+		return err
+	}
 	overlay := filesystem.OverlayConfig{
-		LowerDirs: []string{lower},
+		LowerDirs: lowers,
 		UpperDir:  filepath.Join(base, "upper"),
 		WorkDir:   filepath.Join(base, "work"),
 		MergedDir: filepath.Join(base, "merged"),
@@ -281,6 +301,9 @@ func parent() (result error) {
 		// Detach this self-bind and its staged virtual-filesystem submounts.
 		result = errors.Join(result, syscall.Unmount(overlay.MergedDir, syscall.MNT_DETACH))
 	}()
+	if err := prepareImageMounts(overlay.MergedDir, hostUID, hostGID); err != nil {
+		return err
+	}
 	if err := filesystem.ParentMountAll(overlay.MergedDir); err != nil {
 		return err
 	}
@@ -349,10 +372,14 @@ func parent() (result error) {
 	defer readyWrite.Close()
 	cmd.ExtraFiles = []*os.File{readyRead}
 
-	fmt.Println("=== Volumes and Bind Mounts ===")
+	fmt.Println("=== Container Images: OCI Format and Layer Extraction ===")
 	fmt.Printf("Parent PID: %d\n", os.Getpid())
 	fmt.Printf("Container name: %s\n\n", containerName)
-	fmt.Printf("Lower:  %s\n", lower)
+	fmt.Printf("Image:  %s\n", *imageName)
+	fmt.Printf("Digest: %s\n", imageID)
+	for i, lower := range lowers {
+		fmt.Printf("Lower[%d]: %s\n", i, lower)
+	}
 	fmt.Printf("Upper:  %s\n", overlay.UpperDir)
 	fmt.Printf("Merged: %s\n", overlay.MergedDir)
 	fmt.Printf("Mapping container UID 0 -> host UID %d\n\n", hostUID)
@@ -381,6 +408,33 @@ func parent() (result error) {
 		return fmt.Errorf("child exited: %w", err)
 	}
 	fmt.Println("Child process exited.")
+	return nil
+}
+
+// An image must not redirect a privileged staging mount through a symlink.
+func prepareImageMounts(root string, uid, gid int) error {
+	for _, name := range []string{"proc", "sys", "dev", ".old_root"} {
+		full := filepath.Join(root, name)
+		info, err := os.Lstat(full)
+		if errors.Is(err, os.ErrNotExist) {
+			if name == ".old_root" {
+				continue
+			} // PivotRoot creates this later.
+			if err := os.Mkdir(full, 0755); err != nil {
+				return err
+			}
+			if err := os.Chown(full, uid, gid); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("image mount target /%s must be a real directory", name)
+		}
+	}
 	return nil
 }
 

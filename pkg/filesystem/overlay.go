@@ -30,8 +30,25 @@ func MountOverlay(c OverlayConfig) error {
 			return fmt.Errorf("overlay: mkdir %s: %w", d, err)
 		}
 	}
+	// Digest directory names contain a literal colon. Escape it inside each
+	// pathname before joining paths with the lowerdir separator.
+	escaped := make([]string, len(c.LowerDirs))
+	for i, dir := range c.LowerDirs {
+		if strings.ContainsAny(dir, ",\\\n") {
+			return fmt.Errorf("unsupported character in lowerdir path")
+		}
+		escaped[i] = strings.ReplaceAll(dir, ":", `\:`)
+	}
+	for _, dir := range []string{c.UpperDir, c.WorkDir, c.MergedDir} {
+		if strings.ContainsAny(dir, ",\\\n") {
+			return fmt.Errorf("unsupported character in overlay path")
+		}
+	}
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
-		strings.Join(c.LowerDirs, ":"), c.UpperDir, c.WorkDir)
+		strings.Join(escaped, ":"), c.UpperDir, c.WorkDir)
+	if len(opts) >= os.Getpagesize() {
+		return fmt.Errorf("overlay mount options exceed one page; use an image with fewer layers")
+	}
 	if err := syscall.Mount("overlay", c.MergedDir, "overlay", 0, opts); err != nil {
 		return fmt.Errorf("overlay: mount %s: %w", c.MergedDir, err)
 	}
