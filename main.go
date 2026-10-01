@@ -16,9 +16,13 @@ import (
 	"github.com/poridhioss/capsule/pkg/filesystem"
 	"github.com/poridhioss/capsule/pkg/image"
 	"github.com/poridhioss/capsule/pkg/namespace"
+	"github.com/poridhioss/capsule/pkg/network"
 )
 
-const capSysAdmin = 21
+const (
+	capNetRaw   = 13
+	capSysAdmin = 21
+)
 
 const inspectScript = `
 set -e
@@ -62,7 +66,7 @@ $5 == "/" {
 echo ""
 
 echo "--- Writable Layer Probe ---"
-echo "lab-10 was here" > /marker.txt
+echo "lab-11 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
@@ -133,6 +137,18 @@ if mounted /config/app.conf; then
     echo "  write blocked: read-only filesystem"
     echo ""
 fi
+
+echo "--- Network Interfaces ---"
+ip link show
+echo ""
+
+echo "--- IPv4 Addresses ---"
+ip -4 addr show
+echo ""
+
+echo "--- IPv4 Routes ---"
+ip -4 route show
+echo ""
 
 echo "========== END INSPECTION =========="
 `
@@ -353,9 +369,10 @@ func parent() (result error) {
 		UTS:         true,
 		Mount:       true,
 		User:        true,
+		Net:         true,
 		UIDMap:      uidMap,
 		GIDMap:      gidMap,
-		AmbientCaps: []uintptr{capSysAdmin},
+		AmbientCaps: []uintptr{capSysAdmin, capNetRaw},
 	}
 	nsCfg.Apply(cmd)
 	cmd.SysProcAttr.Credential = &syscall.Credential{
@@ -363,7 +380,7 @@ func parent() (result error) {
 	}
 
 	// The child's first application step is to wait on FD 3. The parent
-	// releases it only after cgroup.AddProcess succeeds.
+	// releases it only after cgroup and network setup both succeed.
 	readyRead, readyWrite, err := os.Pipe()
 	if err != nil {
 		return err
@@ -372,7 +389,7 @@ func parent() (result error) {
 	defer readyWrite.Close()
 	cmd.ExtraFiles = []*os.File{readyRead}
 
-	fmt.Println("=== Container Images: OCI Format and Layer Extraction ===")
+	fmt.Println("=== Network Namespaces and Veth Pairs ===")
 	fmt.Printf("Parent PID: %d\n", os.Getpid())
 	fmt.Printf("Container name: %s\n\n", containerName)
 	fmt.Printf("Image:  %s\n", *imageName)
@@ -383,6 +400,13 @@ func parent() (result error) {
 	fmt.Printf("Upper:  %s\n", overlay.UpperDir)
 	fmt.Printf("Merged: %s\n", overlay.MergedDir)
 	fmt.Printf("Mapping container UID 0 -> host UID %d\n\n", hostUID)
+
+	// Register this before the child-stop defer below: on failure, stop and
+	// reap the child first, then remove our host-side network resources.
+	var connection *network.Connection
+	defer func() {
+		result = errors.Join(result, connection.Cleanup())
+	}()
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start child: %w", err)
@@ -398,6 +422,24 @@ func parent() (result error) {
 	if err := cgroup.AddProcess(containerName, cmd.Process.Pid); err != nil {
 		return fmt.Errorf("add child to cgroup: %w", err)
 	}
+	connection, err = network.Setup(cmd.Process.Pid)
+	if err != nil {
+		return fmt.Errorf("set up network: %w", err)
+	}
+	hostNS, err := network.NamespaceID(os.Getpid())
+	if err != nil {
+		return err
+	}
+	childNS, err := network.NamespaceID(cmd.Process.Pid)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Child host PID: %d\n", cmd.Process.Pid)
+	fmt.Printf("Host network namespace: %s\n", hostNS)
+	fmt.Printf("Child network namespace: %s\n", childNS)
+	fmt.Printf("Host veth: %s (%s)\n", network.HostIfName, network.HostCIDR)
+	fmt.Printf("Container interface: %s (%s)\n\n", network.ContainerIfName, network.ContainerCIDR)
+
 	if _, err := readyWrite.Write([]byte{1}); err != nil {
 		return fmt.Errorf("release child: %w", err)
 	}
