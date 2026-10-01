@@ -99,16 +99,33 @@ func Setup(childPID int) (_ *Connection, result error) {
 	connection.child = child
 
 	veth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{Name: HostIfName, Alias: connection.alias},
+		LinkAttrs: netlink.LinkAttrs{Name: HostIfName},
 		PeerName:  PeerIfName,
 	}
 	if err := host.LinkAdd(veth); err != nil {
 		return nil, fmt.Errorf("create veth pair: %w", err)
 	}
-	connection.created = true
-	hostLink, err := host.LinkByName(HostIfName)
+	// LinkAdd records the new host endpoint's interface index.
+	createdIndex := veth.Attrs().Index
+	if createdIndex <= 0 {
+		return nil, fmt.Errorf("created veth has no interface index; inspect %s before retrying", HostIfName)
+	}
+	// Setup can fail before the alias is established. Roll back only the
+	// pair created above, using its saved index rather than a name lookup.
+	// This defer runs before Cleanup closes the namespace and handles.
+	defer func() {
+		if result == nil {
+			return
+		}
+		created := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: createdIndex}}
+		if err := host.LinkDel(created); err != nil && !errors.Is(err, syscall.ENODEV) {
+			result = errors.Join(result, fmt.Errorf("roll back new veth pair: %w", err))
+		}
+	}()
+
+	hostLink, err := host.LinkByIndex(createdIndex)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find new host veth: %w", err)
 	}
 	peer, err := host.LinkByName(PeerIfName)
 	if err != nil {
@@ -149,6 +166,23 @@ func Setup(childPID int) (_ *Connection, result error) {
 	}); err != nil {
 		return nil, fmt.Errorf("add child default route: %w", err)
 	}
+	// Set the ownership marker after configuring the pair, then verify
+	// the kernel's value before releasing the child to run its workload.
+	if err := host.LinkSetAlias(hostLink, connection.alias); err != nil {
+		return nil, fmt.Errorf("set host veth alias: %w", err)
+	}
+	hostLink, err = host.LinkByIndex(createdIndex)
+	if err != nil {
+		return nil, fmt.Errorf("read back host veth alias: %w", err)
+	}
+	if hostLink.Type() != "veth" || hostLink.Attrs().Alias != connection.alias {
+		return nil, fmt.Errorf(
+			"verify host veth ownership: type=%q alias=%q; expected type=\"veth\" alias=%q",
+			hostLink.Type(), hostLink.Attrs().Alias, connection.alias,
+		)
+	}
+	// Normal cleanup may now require the verified type and alias.
+	connection.created = true
 	return connection, nil
 }
 
