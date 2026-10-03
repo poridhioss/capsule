@@ -18,7 +18,7 @@ type Store struct {
 	lock     *os.File
 }
 
-// Keep the lock until an image command, or the entire container run, finishes.
+// Serialize image preparation and image-management commands.
 func OpenStore(root string, uid, gid int) (*Store, error) {
 	for _, part := range []string{"images/manifests", "images/configs", "images/tags", "layers", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(root, part), 0755); err != nil {
@@ -31,7 +31,7 @@ func OpenStore(root string, uid, gid int) (*Store, error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("image store busy; wait for the other capsule command or container to finish")
+		return nil, fmt.Errorf("image store busy; retry after the other image operation finishes")
 	}
 	s := &Store{root, uid, gid, f}
 	owner := filepath.Join(root, "images", "owner.json")
@@ -161,7 +161,7 @@ func PinContainer(base, id string) error {
 	old, err := os.ReadFile(file)
 	if err == nil {
 		if strings.TrimSpace(string(old)) != id {
-			return fmt.Errorf("container writable layer belongs to another image; choose a new CAPSULE_NAME")
+			return fmt.Errorf("container writable layer belongs to another image; choose a new --name")
 		}
 		return nil
 	}

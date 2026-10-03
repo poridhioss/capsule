@@ -144,9 +144,15 @@ func ParentMountAll(rootfs string) error {
 		return fmt.Errorf("mount /dev: %w", err)
 	}
 	for _, d := range defaultDevNodes {
+		path := rootfs + d.path
 		dev := int((d.major << 8) | d.minor)
-		if err := syscall.Mknod(rootfs+d.path, syscall.S_IFCHR|d.mode, dev); err != nil {
+		if err := syscall.Mknod(path, syscall.S_IFCHR|d.mode, dev); err != nil {
 			return fmt.Errorf("mknod %s: %w", d.path, err)
+		}
+		// Mknod applies the parent's umask. Restore the intended mode
+		// before the child accesses this host-root-owned device.
+		if err := os.Chmod(path, os.FileMode(d.mode)); err != nil {
+			return fmt.Errorf("chmod %s: %w", d.path, err)
 		}
 	}
 	for _, s := range devSymlinks {

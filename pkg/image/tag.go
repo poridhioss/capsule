@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 type Tag struct{ Name, Digest string }
@@ -143,6 +144,11 @@ func (s *Store) references(skip string) (map[string]int, map[string]int, map[str
 }
 
 func (s *Store) Remove(value string) error {
+	unused, err := s.layerUseLock(syscall.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer unused.Close()
 	r, err := ParseReference(value)
 	if err != nil {
 		return err

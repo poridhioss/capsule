@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	capNetRaw   = 13
-	capSysAdmin = 21
+	capNetBindService = 10
+	capNetRaw         = 13
+	capSysAdmin       = 21
 )
 
 const inspectScript = `
@@ -66,7 +67,7 @@ $5 == "/" {
 echo ""
 
 echo "--- Writable Layer Probe ---"
-echo "lab-11 was here" > /marker.txt
+echo "lab-12 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
@@ -150,6 +151,10 @@ echo "--- IPv4 Routes ---"
 ip -4 route show
 echo ""
 
+echo "--- DNS Configuration ---"
+cat /etc/resolv.conf
+echo ""
+
 echo "========== END INSPECTION =========="
 `
 
@@ -167,6 +172,19 @@ func (f mountFlag) Set(value string) error {
 		return err
 	}
 	*f.specs = append(*f.specs, spec)
+	return nil
+}
+
+type portFlag []network.PortMapping
+
+func (p *portFlag) String() string { return "" }
+
+func (p *portFlag) Set(value string) error {
+	mapping, err := network.ParsePort(value)
+	if err != nil {
+		return err
+	}
+	*p = append(*p, mapping)
 	return nil
 }
 
@@ -196,8 +214,15 @@ func main() {
 
 func parent() (result error) {
 	var specs []filesystem.Mount
+	var ports portFlag
+	defaultName := os.Getenv("CAPSULE_NAME")
+	if defaultName == "" {
+		defaultName = "demo"
+	}
 	flags := flag.NewFlagSet("capsule", flag.ContinueOnError)
 	imageName := flags.String("image", "alpine:latest", "local or Docker Hub image")
+	name := flags.String("name", defaultName, "container name")
+	flags.Var(&ports, "p", "hostPort:containerPort (TCP/IPv4)")
 	flags.Var(mountFlag{&specs, filesystem.ParseVolume}, "v", "source:/target[:ro|rw]")
 	flags.Var(mountFlag{&specs, filesystem.ParseTmpfs}, "tmpfs", "/target[:size=16m,mode=1777]")
 	createVolume := flags.String("volume-create", "", "create or reuse a named volume")
@@ -220,8 +245,8 @@ func parent() (result error) {
 			actions++
 		}
 	}
-	if actions > 1 || (actions == 1 && (len(specs) != 0 || len(flags.Args()) != 0)) {
-		return fmt.Errorf("use one volume-management flag without mounts or a workload")
+	if actions > 1 || (actions == 1 && (len(specs) != 0 || len(ports) != 0 || len(flags.Args()) != 0)) {
+		return fmt.Errorf("use one volume-management flag without mounts, ports, or a workload")
 	}
 	if *createVolume != "" {
 		dir, err := filesystem.CreateNamedVolume(*createVolume, hostUID, hostGID)
@@ -250,25 +275,24 @@ func parent() (result error) {
 		return nil
 	}
 
-	containerName := os.Getenv("CAPSULE_NAME")
-	if containerName == "" {
-		containerName = "demo"
-	}
+	containerName := *name
 	if err := filesystem.ValidateName(containerName); err != nil {
 		return err
 	}
 	if runtime.GOARCH != "amd64" {
 		return fmt.Errorf("this lab runs linux/amd64 images; use the x86-64 lab VM")
 	}
-	store, err := image.OpenStore(image.StoreRoot, hostUID, hostGID)
+	imageID, lowers, imageUse, err := image.PrepareForRun(image.StoreRoot, *imageName, hostUID, hostGID)
 	if err != nil {
 		return err
 	}
-	defer store.Close()
-	imageID, lowers, err := store.Ensure(*imageName)
+	defer imageUse.Close()
+
+	connection, err := network.Reserve(containerName, ports)
 	if err != nil {
 		return err
 	}
+	defer func() { result = errors.Join(result, connection.Cleanup()) }()
 	base, err := filepath.Abs(filepath.Join("containers", containerName))
 	if err != nil {
 		return err
@@ -281,6 +305,16 @@ func parent() (result error) {
 		UpperDir:  filepath.Join(base, "upper"),
 		WorkDir:   filepath.Join(base, "work"),
 		MergedDir: filepath.Join(base, "merged"),
+	}
+
+	dnsFile, err := prepareDNSFile(base)
+	if err != nil {
+		return err
+	}
+	specs = append([]filesystem.Mount{{Kind: filesystem.MountBind,
+		Source: dnsFile, Target: "/etc/resolv.conf", ReadOnly: true}}, specs...)
+	if err := filesystem.ValidateMounts(specs); err != nil {
+		return fmt.Errorf("mount conflicts with the runtime DNS file: %w", err)
 	}
 
 	for i := range specs {
@@ -372,7 +406,7 @@ func parent() (result error) {
 		Net:         true,
 		UIDMap:      uidMap,
 		GIDMap:      gidMap,
-		AmbientCaps: []uintptr{capSysAdmin, capNetRaw},
+		AmbientCaps: []uintptr{capSysAdmin, capNetRaw, capNetBindService},
 	}
 	nsCfg.Apply(cmd)
 	cmd.SysProcAttr.Credential = &syscall.Credential{
@@ -389,7 +423,7 @@ func parent() (result error) {
 	defer readyWrite.Close()
 	cmd.ExtraFiles = []*os.File{readyRead}
 
-	fmt.Println("=== Network Namespaces and Veth Pairs ===")
+	fmt.Println("=== Bridge Networking, NAT, and Port Mapping ===")
 	fmt.Printf("Parent PID: %d\n", os.Getpid())
 	fmt.Printf("Container name: %s\n\n", containerName)
 	fmt.Printf("Image:  %s\n", *imageName)
@@ -400,13 +434,6 @@ func parent() (result error) {
 	fmt.Printf("Upper:  %s\n", overlay.UpperDir)
 	fmt.Printf("Merged: %s\n", overlay.MergedDir)
 	fmt.Printf("Mapping container UID 0 -> host UID %d\n\n", hostUID)
-
-	// Register this before the child-stop defer below: on failure, stop and
-	// reap the child first, then remove our host-side network resources.
-	var connection *network.Connection
-	defer func() {
-		result = errors.Join(result, connection.Cleanup())
-	}()
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start child: %w", err)
@@ -422,8 +449,7 @@ func parent() (result error) {
 	if err := cgroup.AddProcess(containerName, cmd.Process.Pid); err != nil {
 		return fmt.Errorf("add child to cgroup: %w", err)
 	}
-	connection, err = network.Setup(cmd.Process.Pid)
-	if err != nil {
+	if err := connection.Setup(cmd.Process.Pid); err != nil {
 		return fmt.Errorf("set up network: %w", err)
 	}
 	hostNS, err := network.NamespaceID(os.Getpid())
@@ -437,8 +463,14 @@ func parent() (result error) {
 	fmt.Printf("Child host PID: %d\n", cmd.Process.Pid)
 	fmt.Printf("Host network namespace: %s\n", hostNS)
 	fmt.Printf("Child network namespace: %s\n", childNS)
-	fmt.Printf("Host veth: %s (%s)\n", network.HostIfName, network.HostCIDR)
-	fmt.Printf("Container interface: %s (%s)\n\n", network.ContainerIfName, network.ContainerCIDR)
+	fmt.Printf("Bridge: %s (%s)\n", network.BridgeName, network.GatewayCIDR)
+	fmt.Printf("Host veth: %s\n", connection.HostIfName)
+	fmt.Printf("Container IPv4: %s/24\n", connection.Lease.IP)
+	fmt.Printf("Gateway: %s\n", network.GatewayIP)
+	for _, port := range connection.Lease.Ports {
+		fmt.Printf("Published TCP: %d -> %s:%d\n", port.HostPort, connection.Lease.IP, port.ContainerPort)
+	}
+	fmt.Println()
 
 	if _, err := readyWrite.Write([]byte{1}); err != nil {
 		return fmt.Errorf("release child: %w", err)
@@ -451,6 +483,22 @@ func parent() (result error) {
 	}
 	fmt.Println("Child process exited.")
 	return nil
+}
+
+// A per-container host file is mounted read-only at /etc/resolv.conf.
+func prepareDNSFile(base string) (string, error) {
+	name := filepath.Join(base, "resolv.conf")
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
+	if err != nil {
+		return "", err
+	}
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		return "", err
+	}
+	_, writeErr := f.WriteString("nameserver 8.8.8.8\noptions timeout:2 attempts:2\n")
+	closeErr := f.Close()
+	return name, errors.Join(writeErr, closeErr)
 }
 
 // An image must not redirect a privileged staging mount through a symlink.
