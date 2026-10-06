@@ -1,6 +1,7 @@
 package container
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,28 +23,34 @@ import (
 )
 
 type Container struct {
-	ID         string                `json:"id"`
-	Name       string                `json:"name"`
-	Image      string                `json:"image"`
-	Cmd        []string              `json:"cmd"`
-	Env        []string              `json:"env"`
-	Mounts     []filesystem.Mount    `json:"mounts,omitempty"`
-	Ports      []network.PortMapping `json:"ports,omitempty"`
-	Base       string                `json:"base"`
-	UID        int                   `json:"host_uid"`
-	GID        int                   `json:"host_gid"`
-	Grace      time.Duration         `json:"stop_timeout_ns"`
-	State      State                 `json:"state"`
-	PID        int                   `json:"pid,omitempty"`
-	OwnerPID   int                   `json:"owner_pid,omitempty"`
-	OwnerStart string                `json:"owner_start,omitempty"`
-	BootID     string                `json:"boot_id,omitempty"`
-	Created    time.Time             `json:"created"`
-	Started    *time.Time            `json:"started,omitempty"`
-	Finished   *time.Time            `json:"finished,omitempty"`
-	ExitCode   *int                  `json:"exit_code,omitempty"`
-	LastError  string                `json:"last_error,omitempty"`
-	CleanupOK  bool                  `json:"cleanup_ok"`
+	ID             string                `json:"id"`
+	Name           string                `json:"name"`
+	Image          string                `json:"image"`
+	Cmd            []string              `json:"cmd"`
+	Env            []string              `json:"env"`
+	Mounts         []filesystem.Mount    `json:"mounts,omitempty"`
+	Ports          []network.PortMapping `json:"ports,omitempty"`
+	Base           string                `json:"base"`
+	UID            int                   `json:"host_uid"`
+	GID            int                   `json:"host_gid"`
+	Grace          time.Duration         `json:"stop_timeout_ns"`
+	State          State                 `json:"state"`
+	PID            int                   `json:"pid,omitempty"`
+	OwnerPID       int                   `json:"owner_pid,omitempty"`
+	OwnerStart     string                `json:"owner_start,omitempty"`
+	BootID         string                `json:"boot_id,omitempty"`
+	Created        time.Time             `json:"created"`
+	Started        *time.Time            `json:"started,omitempty"`
+	Finished       *time.Time            `json:"finished,omitempty"`
+	ExitCode       *int                  `json:"exit_code,omitempty"`
+	LastError      string                `json:"last_error,omitempty"`
+	CleanupOK      bool                  `json:"cleanup_ok"`
+	InitStart      string                `json:"init_start,omitempty"`
+	Restart        RestartPolicy         `json:"restart"`
+	RestartCount   int                   `json:"restart_count"`
+	RestartPending bool                  `json:"restart_pending"`
+	HealthCheck    *HealthCheck          `json:"health_check,omitempty"`
+	Health         *HealthStatus         `json:"health,omitempty"`
 }
 
 // Create persists configuration only. Start performs image and kernel setup.
@@ -61,6 +68,15 @@ func (c *Container) Create() error {
 	}
 	if c.UID <= 0 || c.GID <= 0 || c.Grace <= 0 || c.Grace > time.Minute {
 		return fmt.Errorf("use a normal sudo user and a grace period between 0 and 1 minute")
+	}
+	if c.Restart.Name == "" {
+		c.Restart.Name = "no"
+	}
+	if err := c.Restart.Validate(); err != nil {
+		return err
+	}
+	if err := c.HealthCheck.Validate(); err != nil {
+		return err
 	}
 	if c.Image == "" {
 		return fmt.Errorf("image must not be empty")
@@ -93,7 +109,6 @@ func (c *Container) Create() error {
 }
 
 func (c *Container) Start(uid, gid int) (code int, result error) {
-	// Unshare and child creation must remain on the same Linux thread.
 	runtime.LockOSThread()
 	lock, err := lockContainer(c.ID)
 	if err != nil {
@@ -114,28 +129,72 @@ func (c *Container) Start(uid, gid int) (code int, result error) {
 	if c.UID != uid || c.GID != gid {
 		return 1, fmt.Errorf("start with the same sudo user that created this container")
 	}
-	c.Started, c.Finished, c.ExitCode = nil, nil, nil
-	c.LastError, c.CleanupOK = "", false
-	c.OwnerPID, c.PID = 0, 0
+	if err := c.Restart.Validate(); err != nil {
+		return 1, err
+	}
+	if err := c.HealthCheck.Validate(); err != nil {
+		return 1, err
+	}
 	signals := make(chan os.Signal, 8)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(signals)
-	code, cleanupErr, runErr := c.run(signals)
-	result = errors.Join(runErr, cleanupErr)
-	if c.State != StateStopped {
-		if err := c.transition(StateStopped); err != nil {
-			return code, errors.Join(result, err)
+	stopping := false
+	c.RestartCount = 0
+	for {
+		consumeStop(signals, &stopping)
+		if stopping {
+			break
 		}
+		c.Started, c.Finished, c.ExitCode = nil, nil, nil
+		c.LastError, c.CleanupOK = "", false
+		c.PID, c.InitStart = 0, ""
+		c.Health = nil
+		if c.HealthCheck != nil {
+			c.Health = &HealthStatus{State: HealthStarting}
+		}
+		var cleanupErr, runErr error
+		code, cleanupErr, runErr = c.run(signals, &stopping)
+		result = errors.Join(runErr, cleanupErr)
+		wasStarted := c.Started != nil
+		if c.State != StateStopped {
+			if err := c.transition(StateStopped); err != nil {
+				return code, errors.Join(result, err)
+			}
+		}
+		now := time.Now().UTC()
+		c.Finished, c.ExitCode = &now, &code
+		c.PID, c.InitStart = 0, ""
+		c.CleanupOK = cleanupErr == nil
+		if result != nil {
+			c.LastError = result.Error()
+		}
+		consumeStop(signals, &stopping)
+		again, delay := c.Restart.ShouldRestart(code, c.RestartCount)
+		// Setup failures, incomplete cleanup, and an explicit stop end this Start.
+		again = again && wasStarted && cleanupErr == nil && !stopping
+		c.RestartPending = again
+		if err := c.Persist(); err != nil {
+			result = errors.Join(result, err)
+			break
+		}
+		fmt.Printf("State: %s\nExit code: %d\n", c.State, code)
+		if !again {
+			break
+		}
+		fmt.Printf("Restart: attempt %d in %s (policy=%s)\n", c.RestartCount+1, delay, c.Restart.Name)
+		if !waitBackoff(signals, delay) {
+			stopping = true
+			break
+		}
+		consumeStop(signals, &stopping)
+		if stopping {
+			break
+		}
+		c.RestartCount++
 	}
-	now := time.Now().UTC()
-	c.Finished, c.ExitCode = &now, &code
-	c.PID, c.OwnerPID, c.OwnerStart, c.BootID = 0, 0, "", ""
-	c.CleanupOK = cleanupErr == nil
-	if result != nil {
-		c.LastError = result.Error()
-	}
+	c.RestartPending = false
+	c.PID, c.OwnerPID, c.OwnerStart, c.BootID, c.InitStart = 0, 0, "", "", ""
 	result = errors.Join(result, c.Persist())
-	fmt.Printf("State: %s\nExit code: %d\n", c.State, code)
 	return code, result
 }
 
@@ -145,10 +204,10 @@ func (c *Container) Stop() error {
 		return err
 	}
 	*c = *current
-	if c.State == StateStopped && c.CleanupOK {
+	if c.State == StateStopped && c.CleanupOK && !c.RestartPending && c.OwnerPID == 0 {
 		return nil
 	}
-	if c.State != StateRunning {
+	if c.OwnerPID <= 1 {
 		return fmt.Errorf("container %s is not running", c.ID)
 	}
 	if err := signalOwner(c); err != nil {
@@ -160,7 +219,7 @@ func (c *Container) Stop() error {
 		if err != nil {
 			return err
 		}
-		if current.State == StateStopped {
+		if current.State == StateStopped && !current.RestartPending && current.OwnerPID == 0 {
 			*c = *current
 			if !c.CleanupOK {
 				return fmt.Errorf("container stopped but cleanup failed: %s", c.LastError)
@@ -270,8 +329,9 @@ func exitStatus(err error) int {
 	return 1
 }
 
-// Normal run path: one Wait goroutine remains active throughout shutdown.
-func waitWithSignals(cmd *exec.Cmd, signals <-chan os.Signal, grace time.Duration) error {
+// One host waiter; health snapshots are persisted by this same owner loop.
+func (c *Container) waitWithSignals(cmd *exec.Cmd, signals <-chan os.Signal,
+	health <-chan HealthStatus, stopping *bool) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	var timer *time.Timer
@@ -285,64 +345,73 @@ func waitWithSignals(cmd *exec.Cmd, signals <-chan os.Signal, grace time.Duratio
 		select {
 		case err := <-done:
 			return err
+		case status, ok := <-health:
+			if !ok {
+				health = nil
+				continue
+			}
+			changed := c.Health == nil || c.Health.State != status.State
+			c.Health = &status
+			if err := c.Persist(); err != nil {
+				*stopping = true
+				_ = cmd.Process.Kill()
+				return errors.Join(err, <-done)
+			}
+			if changed {
+				fmt.Printf("Health: %s\n", status.State)
+			}
 		case sig := <-signals:
+			*stopping = true
 			if timer != nil {
-				continue // Repeated signals do not restart the grace period.
+				continue
 			}
 			fmt.Printf("Shutdown: forwarding %s to container init\n", sig)
 			if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				_ = cmd.Process.Kill()
 				return errors.Join(err, <-done)
 			}
-			timer = time.NewTimer(grace)
+			timer = time.NewTimer(c.Grace)
 			deadline = timer.C
 		case <-deadline:
 			fmt.Println("Shutdown: grace period expired; sending SIGKILL")
-			_ = cmd.Process.Kill() // Killing namespace PID 1 terminates its members.
+			_ = cmd.Process.Kill()
 			deadline = nil
 		}
 	}
 }
 
-// PID 1 owns all waits here: reap orphans without racing exec.Cmd.Wait.
-func reapWorkload(cmd *exec.Cmd) (int, error) {
-	defer cmd.Process.Release()
-	for {
-		var status syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &status, 0, nil)
-		if errors.Is(err, syscall.EINTR) {
-			continue
-		}
-		if err != nil {
-			return 1, err
-		}
-		if pid != cmd.Process.Pid {
-			continue
-		}
-		if status.Signaled() {
-			return 128 + int(status.Signal()), nil
-		}
-		return status.ExitStatus(), nil
-	}
-}
-
 func Child() (int, error) {
-	if len(os.Args) < 4 {
+	if len(os.Args) < 5 {
 		return 1, fmt.Errorf("child: missing merged path or workload")
+	}
+	var hc *HealthCheck
+	if err := json.Unmarshal([]byte(os.Args[3]), &hc); err != nil {
+		return 1, err
+	}
+	if err := hc.Validate(); err != nil {
+		return 1, err
 	}
 	signals := make(chan os.Signal, 8)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(signals)
+	report := os.NewFile(5, "health-reports")
+	if report == nil {
+		return 1, fmt.Errorf("child: missing health pipe")
+	}
+	defer report.Close()
+	for _, fd := range []int{3, 4, 5} {
+		syscall.CloseOnExec(fd)
+	}
 	ready, installed := os.NewFile(3, "start-gate"), os.NewFile(4, "signal-ready")
 	if ready == nil || installed == nil {
 		return 1, fmt.Errorf("child: missing synchronization pipes")
 	}
 	defer ready.Close()
+	defer installed.Close()
 	if _, err := installed.Write([]byte{1}); err != nil {
 		installed.Close()
 		return 1, err
 	}
-	_ = installed.Close()
 	var token [1]byte
 	if _, err := io.ReadFull(ready, token[:]); err != nil || token[0] != 1 {
 		return 1, fmt.Errorf("child: parent did not release the start gate")
@@ -362,36 +431,11 @@ func Child() (int, error) {
 	if err := filesystem.PivotRoot(merged); err != nil {
 		return 1, err
 	}
-	cmd := exec.Command(os.Args[3], os.Args[4:]...)
+	cmd := exec.Command(os.Args[4], os.Args[5:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = os.Environ() // Already the explicit, merged container environment.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return superviseWorkload(cmd, signals)
-}
-
-func superviseWorkload(cmd *exec.Cmd, signals <-chan os.Signal) (int, error) {
-	if err := cmd.Start(); err != nil {
-		return 1, err
-	}
-	workloadPGID := cmd.Process.Pid
-	type outcome struct {
-		code int
-		err  error
-	}
-	done := make(chan outcome, 1)
-	go func() { code, err := reapWorkload(cmd); done <- outcome{code, err} }()
-	for {
-		select {
-		case result := <-done:
-			return result.code, result.err
-		case sig := <-signals:
-			// A negative PID addresses the workload's process group, including
-			// ordinary shell children that have not created another group.
-			if err := syscall.Kill(-workloadPGID, sig.(syscall.Signal)); err != nil && !errors.Is(err, syscall.ESRCH) {
-				return 1, fmt.Errorf("forward signal to workload: %w", err)
-			}
-		}
-	}
+	return superviseWorkload(cmd, signals, hc, report, installed)
 }
 
 const (
@@ -400,7 +444,7 @@ const (
 	capNetBindService = 10
 )
 
-func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr error) {
+func (c *Container) run(signals <-chan os.Signal, stopping *bool) (code int, cleanupErr, runErr error) {
 	code = 1
 	if runtime.GOARCH != "amd64" {
 		return 1, nil, fmt.Errorf("use the x86-64 EC2 lab instance")
@@ -503,6 +547,7 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 	}); err != nil {
 		return 1, nil, err
 	}
+
 	workload := c.Cmd
 	if len(workload) == 0 {
 		workload = []string{"/bin/sh", "-c", inspectScript, "capsule-inspect"}
@@ -510,7 +555,11 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 			workload = append(workload, spec.Target)
 		}
 	}
-	args := append([]string{"child", overlay.MergedDir}, workload...)
+	healthConfig, err := json.Marshal(c.HealthCheck)
+	if err != nil {
+		return 1, nil, err
+	}
+	args := append([]string{"child", overlay.MergedDir, string(healthConfig)}, workload...)
 	cmd = exec.Command("/proc/self/exe", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = c.Env
@@ -536,9 +585,15 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 	}
 	defer installedRead.Close()
 	defer installedWrite.Close()
-	cmd.ExtraFiles = []*os.File{readyRead, installedWrite}
+	healthRead, healthWrite, err := os.Pipe()
+	if err != nil {
+		return 1, nil, err
+	}
+	defer healthRead.Close()
+	defer healthWrite.Close()
+	cmd.ExtraFiles = []*os.File{readyRead, installedWrite, healthWrite}
 
-	fmt.Println("=== Container Lifecycle Management ===")
+	fmt.Println("=== Operational Features: Copy, Restart, and Health ===")
 	fmt.Printf("Parent PID: %d\nContainer name: %s\nImage: %s\n", os.Getpid(), c.Name, c.Image)
 	fmt.Printf("Upper: %s\nMerged: %s\n", overlay.UpperDir, overlay.MergedDir)
 	fmt.Printf("Mapping container UID 0 -> host UID %d\n", c.UID)
@@ -548,6 +603,7 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 	started = true
 	_ = readyRead.Close()
 	_ = installedWrite.Close()
+	_ = healthWrite.Close()
 	if err := cgroup.AddProcess(c.ID, cmd.Process.Pid); err != nil {
 		return 1, nil, err
 	}
@@ -556,6 +612,18 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 		return 1, nil, fmt.Errorf("child did not acknowledge signal handlers")
 	}
 	if err := connection.Setup(cmd.Process.Pid); err != nil {
+		return 1, nil, err
+	}
+	// The second acknowledgement means pivot_root and workload Start succeeded.
+	if _, err := readyWrite.Write([]byte{1}); err != nil {
+		return 1, nil, err
+	}
+	_ = readyWrite.Close()
+	if _, err := io.ReadFull(installedRead, ack[:]); err != nil || ack[0] != 2 {
+		return 1, nil, fmt.Errorf("child did not acknowledge rootfs and workload readiness")
+	}
+	c.InitStart, err = processStart(cmd.Process.Pid)
+	if err != nil {
 		return 1, nil, err
 	}
 	c.OwnerStart, err = processStart(os.Getpid())
@@ -567,6 +635,7 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 		return 1, nil, err
 	}
 	c.OwnerPID, c.PID = os.Getpid(), cmd.Process.Pid
+	c.RestartPending = false
 	now := time.Now().UTC()
 	c.Started = &now
 	if err := c.transition(StateRunning); err != nil {
@@ -576,15 +645,16 @@ func (c *Container) run(signals <-chan os.Signal) (code int, cleanupErr, runErr 
 		return 1, nil, err
 	}
 	fmt.Printf("State: %s\nChild host PID: %d\n", c.State, c.PID)
+	if c.Health != nil {
+		fmt.Printf("Health: %s\n", c.Health.State)
+	}
 	fmt.Printf("Bridge: %s (%s)\nContainer IPv4: %s/24\n", network.BridgeName, network.GatewayCIDR, connection.Lease.IP)
 	for _, port := range c.Ports {
 		fmt.Printf("Published TCP: %d -> %s:%d\n", port.HostPort, connection.Lease.IP, port.ContainerPort)
 	}
-	if _, err := readyWrite.Write([]byte{1}); err != nil {
-		return 1, nil, err
-	}
-	_ = readyWrite.Close()
-	err = waitWithSignals(cmd, signals, c.Grace)
+	updates, closeHealth := readHealth(healthRead)
+	defer closeHealth()
+	err = c.waitWithSignals(cmd, signals, updates, stopping)
 	waited = true
 	code = exitStatus(err)
 	if err == nil {
@@ -678,7 +748,7 @@ $5 == "/" {
 echo ""
 
 echo "--- Writable Layer Probe ---"
-echo "lab-13 was here" > /marker.txt
+echo "lab-14 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
