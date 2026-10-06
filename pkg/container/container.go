@@ -17,6 +17,7 @@ import (
 	"github.com/poridhioss/capsule/pkg/cgroup"
 	"github.com/poridhioss/capsule/pkg/filesystem"
 	"github.com/poridhioss/capsule/pkg/image"
+	"github.com/poridhioss/capsule/pkg/logging"
 	"github.com/poridhioss/capsule/pkg/namespace"
 	"github.com/poridhioss/capsule/pkg/network"
 	"golang.org/x/sys/unix"
@@ -51,6 +52,7 @@ type Container struct {
 	RestartPending bool                  `json:"restart_pending"`
 	HealthCheck    *HealthCheck          `json:"health_check,omitempty"`
 	Health         *HealthStatus         `json:"health,omitempty"`
+	Detached       bool                  `json:"detached"`
 }
 
 // Create persists configuration only. Start performs image and kernel setup.
@@ -108,7 +110,18 @@ func (c *Container) Create() error {
 	return c.Persist()
 }
 
-func (c *Container) Start(uid, gid int) (code int, result error) {
+// Start keeps the caller attached and tees the workload output to its logs.
+func (c *Container) Start(uid, gid int) (int, error) {
+	return c.start(uid, gid, false, nil)
+}
+
+type runIO struct {
+	stdin          io.Reader
+	stdout, stderr io.Writer
+	ready          func() error
+}
+
+func (c *Container) start(uid, gid int, detached bool, ready func() error) (code int, result error) {
 	runtime.LockOSThread()
 	lock, err := lockContainer(c.ID)
 	if err != nil {
@@ -138,6 +151,32 @@ func (c *Container) Start(uid, gid int) (code int, result error) {
 	signals := make(chan os.Signal, 8)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(signals)
+	driver := logging.Driver{
+		StdoutPath: filepath.Join(Root, c.ID, "stdout.log"),
+		StderrPath: filepath.Join(Root, c.ID, "stderr.log"),
+	}
+	out, errOut, err := driver.Open()
+	if err != nil {
+		return 1, err
+	}
+	streams := runIO{stdout: out, stderr: errOut, ready: ready}
+	if !detached {
+		streams.stdin = os.Stdin
+		streams.stdout = io.MultiWriter(out, os.Stdout)
+		streams.stderr = io.MultiWriter(errOut, os.Stderr)
+	}
+	c.Detached = detached
+	// Wait drains os/exec's copy goroutines before these writers are closed.
+	// Final owner clearance happens after the logs have been flushed.
+	defer func() {
+		result = errors.Join(result, out.Close(), errOut.Close())
+		c.RestartPending = false
+		c.PID, c.OwnerPID, c.OwnerStart, c.BootID, c.InitStart = 0, 0, "", "", ""
+		if result != nil {
+			c.LastError = result.Error()
+		}
+		result = errors.Join(result, c.Persist())
+	}()
 	stopping := false
 	c.RestartCount = 0
 	for {
@@ -153,7 +192,7 @@ func (c *Container) Start(uid, gid int) (code int, result error) {
 			c.Health = &HealthStatus{State: HealthStarting}
 		}
 		var cleanupErr, runErr error
-		code, cleanupErr, runErr = c.run(signals, &stopping)
+		code, cleanupErr, runErr = c.run(signals, &stopping, streams)
 		result = errors.Join(runErr, cleanupErr)
 		wasStarted := c.Started != nil
 		if c.State != StateStopped {
@@ -192,10 +231,95 @@ func (c *Container) Start(uid, gid int) (code int, result error) {
 		}
 		c.RestartCount++
 	}
-	c.RestartPending = false
-	c.PID, c.OwnerPID, c.OwnerStart, c.BootID, c.InitStart = 0, 0, "", "", ""
-	result = errors.Join(result, c.Persist())
 	return code, result
+}
+
+type startResult struct {
+	ID    string `json:"id"`
+	Error string `json:"error,omitempty"`
+}
+
+// Detach starts an independent owner; it waits for readiness, not workload exit.
+func (c *Container) Detach(uid, gid int) error {
+	current, err := Load(c.ID)
+	if err != nil {
+		return err
+	}
+	if current.UID != uid || current.GID != gid {
+		return fmt.Errorf("start with the same sudo user that created this container")
+	}
+	read, write, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer read.Close()
+	defer write.Close()
+	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer null.Close()
+	cmd := exec.Command("/proc/self/exe", "supervise", c.ID)
+	cmd.Env = os.Environ()
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = null, null, null
+	cmd.ExtraFiles = []*os.File{write}
+	// The owner must survive this launcher exiting. No Pdeathsig here.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	_ = write.Close()
+	var response startResult
+	if err := json.NewDecoder(read).Decode(&response); err != nil {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		return errors.Join(fmt.Errorf("detached owner did not report readiness: %w", err), cmd.Wait())
+	}
+	if response.Error != "" {
+		return errors.Join(fmt.Errorf("detached startup: %s", response.Error), cmd.Wait())
+	}
+	if response.ID != c.ID {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		return errors.Join(fmt.Errorf("detached owner reported a different container"), cmd.Wait())
+	}
+	// The successful CLI must not wait for the long-running owner.
+	return cmd.Process.Release()
+}
+
+// Supervise is an internal re-exec entry point, not a student-facing command.
+func Supervise(id string, uid, gid int) (int, error) {
+	if os.Geteuid() != 0 {
+		return 1, fmt.Errorf("supervisor requires the sudo launcher")
+	}
+	ready := os.NewFile(3, "detached-ready")
+	if ready == nil {
+		return 1, fmt.Errorf("supervisor: missing readiness pipe")
+	}
+	syscall.CloseOnExec(3)
+	defer ready.Close()
+	sent := false
+	report := func(err error) error {
+		if sent {
+			return nil
+		}
+		sent = true
+		message := startResult{ID: id}
+		if err != nil {
+			message.Error = err.Error()
+		}
+		return errors.Join(json.NewEncoder(ready).Encode(message), ready.Close())
+	}
+	c, err := Load(id)
+	if err != nil {
+		return 1, errors.Join(err, report(err))
+	}
+	code, err := c.start(uid, gid, true, func() error { return report(nil) })
+	if !sent {
+		if err == nil {
+			err = fmt.Errorf("execution ended before workload readiness")
+		}
+		err = errors.Join(err, report(err))
+	}
+	return code, err
 }
 
 func (c *Container) Stop() error {
@@ -444,7 +568,7 @@ const (
 	capNetBindService = 10
 )
 
-func (c *Container) run(signals <-chan os.Signal, stopping *bool) (code int, cleanupErr, runErr error) {
+func (c *Container) run(signals <-chan os.Signal, stopping *bool, streams runIO) (code int, cleanupErr, runErr error) {
 	code = 1
 	if runtime.GOARCH != "amd64" {
 		return 1, nil, fmt.Errorf("use the x86-64 EC2 lab instance")
@@ -561,7 +685,7 @@ func (c *Container) run(signals <-chan os.Signal, stopping *bool) (code int, cle
 	}
 	args := append([]string{"child", overlay.MergedDir, string(healthConfig)}, workload...)
 	cmd = exec.Command("/proc/self/exe", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = streams.stdin, streams.stdout, streams.stderr
 	cmd.Env = c.Env
 	uidMap, gidMap := namespace.DefaultMapping(c.UID, c.GID)
 	nsCfg := namespace.Config{
@@ -593,7 +717,7 @@ func (c *Container) run(signals <-chan os.Signal, stopping *bool) (code int, cle
 	defer healthWrite.Close()
 	cmd.ExtraFiles = []*os.File{readyRead, installedWrite, healthWrite}
 
-	fmt.Println("=== Operational Features: Copy, Restart, and Health ===")
+	fmt.Println("=== Detached Mode and Container Logging ===")
 	fmt.Printf("Parent PID: %d\nContainer name: %s\nImage: %s\n", os.Getpid(), c.Name, c.Image)
 	fmt.Printf("Upper: %s\nMerged: %s\n", overlay.UpperDir, overlay.MergedDir)
 	fmt.Printf("Mapping container UID 0 -> host UID %d\n", c.UID)
@@ -643,6 +767,12 @@ func (c *Container) run(signals <-chan os.Signal, stopping *bool) (code int, cle
 	}
 	if err := c.Persist(); err != nil {
 		return 1, nil, err
+	}
+	if streams.ready != nil {
+		if err := streams.ready(); err != nil {
+			*stopping = true
+			return 1, nil, fmt.Errorf("report detached readiness: %w", err)
+		}
 	}
 	fmt.Printf("State: %s\nChild host PID: %d\n", c.State, c.PID)
 	if c.Health != nil {
@@ -748,7 +878,7 @@ $5 == "/" {
 echo ""
 
 echo "--- Writable Layer Probe ---"
-echo "lab-14 was here" > /marker.txt
+echo "lab-15 was here" > /marker.txt
 echo "  wrote /marker.txt:  $(cat /marker.txt)"
 echo ""
 
